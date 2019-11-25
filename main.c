@@ -12,11 +12,10 @@
 #include <stdlib.h>     /* for atoi() and exit() */
 #include <string.h>     /* for memset() */
 #include <unistd.h>     /* for files handling */
-#include <stdint.h>
+#include <fcntl.h>		/* for files handling */
 
-#define MAX_CLIENT		10
+#define MAX_CLIENTS		10
 #define BUFFER_SIZE		100
-
 
 /* I am the server */
 
@@ -27,7 +26,7 @@ int main(int argc, char **argv)
 	int n_bytes, status;
 	short port;
 	unsigned int addr_len;
-	int fd, max_client_fd;
+	int fd_client, fd_requested, max_client_fd;
 	fd_set sock_set, tmp_set;
 	struct sockaddr_in client_addr, server_addr;
 
@@ -53,7 +52,7 @@ int main(int argc, char **argv)
 			return 0;
 		}
 
-		status = listen(server_sock, MAX_CLIENT);
+		status = listen(server_sock, MAX_CLIENTS);
 		if (status < 0) {
 			printf("Server unable to listen\n");
 			return 0;
@@ -65,83 +64,57 @@ int main(int argc, char **argv)
 		max_client_fd = server_sock;
 		addr_len = sizeof(addr_len);
 
-		while (1) {
-			tmp_set = sock_set;
-			if (select(max_client_fd + 1, &tmp_set, NULL, NULL, NULL) < 0) {
-				printf("Error in select\n");
-				continue;
+		tmp_set = sock_set;
+		while (select(max_client_fd + 1, &tmp_set, NULL, NULL, NULL) > 0) {
+			if (FD_ISSET(server_sock, &tmp_set)) { /* A new connection on server socket */
+				new_sock = accept(server_sock, (struct sockaddr *)&client_addr, &addr_len);
+				if (new_sock < 0) {
+					printf("Error accepting new client\n");
+					continue;
+				}
+
+				/* Add the new socket to sockets list */
+				FD_SET(new_sock, &sock_set);
+				if (new_sock > max_client_fd) {
+					max_client_fd = new_sock;
+				}
 			}
 
-			for(fd = 0; fd <= max_client_fd; fd++) {
-				if (FD_ISSET(fd, &tmp_set)) {
-					if (fd == server_sock) { /* A new connection on server socket */
-						new_sock = accept(server_sock, (struct sockaddr *)&client_addr, &addr_len);
-						if (new_sock < 0) {
-							printf("Error accepting new client\n");
+			for(fd_client = 0; fd_client <= max_client_fd; fd_client++) {
+				if (FD_ISSET(fd_client, &tmp_set) && fd_client != server_sock) {
+					n_bytes = recv(fd_client, server_buffer, BUFFER_SIZE, 0);
+					if (n_bytes < 0) {
+						printf("Error receiving from client %d\n", fd_client);
+						close(fd_client);
+						FD_CLR(fd_client, &sock_set);
+					} else if (n_bytes == 0) {
+						printf("Client %d closed connection\n", fd_client);
+						close(fd_client);
+						FD_CLR(fd_client, &sock_set);
+					}
+					else {
+						printf("Client %d wants file: %s\n", fd_client, server_buffer);
+						fd_requested = open(server_buffer, O_RDONLY, 0644);
+
+						if (fd_requested < 0) {
+							printf("File not found\n");
+							memset(server_buffer, 0, sizeof(server_buffer));
+							strncpy(server_buffer, "File not found", strlen("File not found") + 1);
+							n_bytes = send(fd_client, server_buffer, strlen(server_buffer) + 1, 0);
 							continue;
 						}
 
-						/* Add the new socket to sockets list */
-						FD_SET(new_sock, &sock_set);
-						if (new_sock > max_client_fd) {
-							max_client_fd = new_sock;
-				}
-					} else { /* receiving something from a open connection */
-						n_bytes = recv(fd, server_buffer, BUFFER_SIZE, 0);
-						if (n_bytes < 0) {
-							printf("Error receiving from client %d\n", fd);
-							close(fd);
-							FD_CLR(fd, &sock_set);
-						} else if (n_bytes == 0) {
-							printf("Client %d closed connection\n", fd);
-							close(fd);
-							FD_CLR(fd, &sock_set);
-						}
-						else {
-							printf("Client %d wants file: %s\n", fd, server_buffer);
-							memset(server_buffer, 0x31, sizeof(server_buffer));
-							n_bytes = send(fd, server_buffer, BUFFER_SIZE, 0);
-							printf("server sent: %d %s\n", n_bytes, server_buffer);
-
+						memset(server_buffer, 0, sizeof(server_buffer));
+						n_bytes = read(fd_requested, &server_buffer, BUFFER_SIZE);
+						while(n_bytes > 0) {
+							send(fd_client, server_buffer, n_bytes, 0);
 							memset(server_buffer, 0, sizeof(server_buffer));
-							memset(server_buffer, 0x33, sizeof(server_buffer));
-							n_bytes = send(fd, server_buffer, BUFFER_SIZE, 0);;
-
-							memset(server_buffer, 0, sizeof(server_buffer));
-							memset(server_buffer, 0x36, sizeof(server_buffer));
-							n_bytes = send(fd, server_buffer, BUFFER_SIZE, 0);
-
-							memset(server_buffer, 0, sizeof(server_buffer));
-							memcpy(server_buffer, "yay", 4);
-							n_bytes = send(fd, server_buffer, 4, 0);
-							printf("server sent: %d %s\n", n_bytes, server_buffer);
-
-
-							memset(server_buffer, 0, sizeof(server_buffer));
-							memcpy(server_buffer, "the end", 8);
-							n_bytes = send(fd, server_buffer, strlen(server_buffer) + 1, 0);
-							printf("server sent: %d %s\n", n_bytes, server_buffer);
-
+							n_bytes = read(fd_requested, &server_buffer, BUFFER_SIZE);
 						}
 					}
 				}
 			}
-		}
-
-		addr_len = sizeof(client_addr);
-		new_sock = accept(server_sock, (struct sockaddr*)&client_addr, &addr_len);
-
-		n_bytes = recv(new_sock, server_buffer, BUFFER_SIZE, 0);
-		if (n_bytes < 0) {
-			printf("Error receiving from client\n");
-		} else {
-			printf("Client wants file: %s\n", server_buffer);
-			memset(server_buffer, 0, sizeof(server_buffer));
-		}
-
-		status = close(new_sock);
-		if (status < 0) {
-			printf("Error closing client socket\n");
+			tmp_set = sock_set;
 		}
 
 		status = close(server_sock);
