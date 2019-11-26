@@ -18,7 +18,9 @@
 #define BUFFER_SIZE				1000
 #define TIMEOUT_SEC				1
 #define TIMEOUT_USEC			0
+#define BAD_FILE_MSG			"Bad file name"
 #define FILE_NOT_FOUND_MSG		"File not found"
+#define SERVER_ERROR_MSG		"Server reading error"
 
 int wildcard_check(char string[]) {
 	int i, len;
@@ -30,6 +32,7 @@ int wildcard_check(char string[]) {
 		case '*':
 		case '[':
 		case ']':
+		case '^':
 			return 0;
 		default:
 			continue;
@@ -39,11 +42,88 @@ int wildcard_check(char string[]) {
 	return 1;
 }
 
+short get_port(char string[]) {
+	short port;
+	int i, len, status;
+
+	len = strlen(string);
+	for (i = 0; i < len; i++) {
+		if (string[i] < '0' || string[i] > '9') {
+			printf("Wrong port format\n");
+			return -1;
+		}
+	}
+	status = sscanf(string, "%hd", &port);
+	if (status == EOF) {
+		printf("sscanf port error\n");
+		return -1;
+	}
+
+	return port;
+}
+
+void process_client(int fd_client, fd_set *sock_set) {
+	int n_bytes_read, n_bytes_sent;
+	int fd_requested;
+	char buffer[BUFFER_SIZE];
+
+	memset(buffer, 0, sizeof(buffer));
+	n_bytes_read = recv(fd_client, buffer, BUFFER_SIZE, 0);
+	if (n_bytes_read < 0) {
+		printf("Error receiving from client %d\n", fd_client);
+		close(fd_client);
+		FD_CLR(fd_client, sock_set);
+	} else if (n_bytes_read == 0) {
+		printf("Client %d closed connection\n", fd_client);
+		close(fd_client);
+		FD_CLR(fd_client, sock_set);
+	} else {
+		/* Check for forbidden characters */
+		if (0 == wildcard_check(buffer)) {
+			memset(buffer, 0, sizeof(buffer));
+			strncpy(buffer, BAD_FILE_MSG, strlen(BAD_FILE_MSG));
+			n_bytes_sent = send(fd_client, buffer, strlen(BAD_FILE_MSG) + 1, 0);
+			return;
+		}
+
+		fd_requested = open(buffer, O_RDONLY, 0600);
+		if (fd_requested < 0) {
+			memset(buffer, 0, sizeof(buffer));
+			strncpy(buffer, FILE_NOT_FOUND_MSG, strlen(FILE_NOT_FOUND_MSG));
+			n_bytes_sent = send(fd_client, buffer, strlen(FILE_NOT_FOUND_MSG) + 1, 0);
+			return;
+		}
+
+		memset(buffer, 0, sizeof(buffer));
+		/* Read from requested file maximum BUFFER_SIZE bytes until the file ends */
+		n_bytes_read = read(fd_requested, &buffer, BUFFER_SIZE);
+		if (n_bytes_read < 0) {
+			printf("Error reading requested file\n");
+			strncpy(buffer, SERVER_ERROR_MSG, strlen(SERVER_ERROR_MSG));
+			n_bytes_sent = send(fd_client, buffer, strlen(SERVER_ERROR_MSG) + 1, 0);
+			return;
+		}
+		while(n_bytes_read > 0) {
+			n_bytes_sent = send(fd_client, buffer, n_bytes_read, 0);
+			if (n_bytes_sent < 0) {
+				printf("Error sending file to client %d\n", fd_client);
+				continue;
+			}
+			if (n_bytes_sent < n_bytes_read) { /* Client buffer may be smaller */
+				while(n_bytes_sent != n_bytes_read) {
+					n_bytes_sent += send(fd_client, buffer + n_bytes_sent, n_bytes_read - n_bytes_sent, 0);
+				}
+			}
+			memset(buffer, 0, sizeof(buffer));
+			n_bytes_read = read(fd_requested, &buffer, BUFFER_SIZE);
+		}
+	}
+}
+
 int main(int argc, char **argv)
 {
-	char server_buffer[BUFFER_SIZE];
-	int server_sock, new_sock, fd_client, fd_requested, max_client_fd;
-	int i, n_bytes_read, n_bytes_sent, status;
+	int server_sock, new_sock, fd_client, max_client_fd;
+	int status;
 	short port;
 	unsigned int addr_len;
 
@@ -58,31 +138,22 @@ int main(int argc, char **argv)
 		printf("Usage ./server server_port\n");
 		return 0;
 	} else {
-		/* check port format */
-		for (i = 0; i < strlen(argv[1]); i++) {
-			if (argv[1][i] < '0' || argv[1][i] > '9') {
-				printf("Wrong port format\n");
-				return 0;
-			}
-		}
-		status = sscanf(argv[1], "%hd", &port);
-		if (status == EOF) {
-			printf("Sscanf port error\n");
+		port = get_port(argv[1]);
+		if (port < 0) {
 			return 0;
 		}
 
+		/* Create server socket */
 		server_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-		if (socket < 0) {
+		if (server_sock < 0) {
 			printf("Error creating server socket\n");
 			return 0;
 		}
 
-		/* Set server address */
+		/* Bind to the default IP address */
 		server_addr.sin_family = AF_INET;
 		server_addr.sin_port = htons(port);
-		/* Bind to the default IP address */
 		server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
 		status = bind(server_sock, (struct sockaddr*)&server_addr, sizeof(server_addr));
 		if (status < 0) {
 			printf("Server unable to bind\n");
@@ -96,11 +167,12 @@ int main(int argc, char **argv)
 		}
 
 		FD_ZERO(&sock_set);
+		/* Use a copy of socket set for select function */
 		FD_ZERO(&tmp_set);
+		/* Monitor server socket for new connections */
 		FD_SET(server_sock, &sock_set);
 		max_client_fd = server_sock;
 		addr_len = sizeof(addr_len);
-
 		while (1) {
 			tmp_set = sock_set;
 			status = select(max_client_fd + 1, &tmp_set, NULL, NULL, &timeout);
@@ -110,7 +182,8 @@ int main(int argc, char **argv)
 			} else if (status == 0) { /* No pending connection */
 				continue;
 			} else {
-				if (FD_ISSET(server_sock, &tmp_set)) { /* A new connection on server socket */
+				if (FD_ISSET(server_sock, &tmp_set)) {
+					/* A new connection on server socket */
 					new_sock = accept(server_sock, (struct sockaddr *)&client_addr, &addr_len);
 					if (new_sock < 0) {
 						printf("Error accepting new client\n");
@@ -124,58 +197,10 @@ int main(int argc, char **argv)
 					}
 				}
 
-				/* Check every client */
+				/* Check if a client sends something */
 				for(fd_client = 0; fd_client <= max_client_fd; fd_client++) {
 					if (FD_ISSET(fd_client, &tmp_set) && fd_client != server_sock) {
-						n_bytes_read = recv(fd_client, server_buffer, BUFFER_SIZE, 0);
-						if (n_bytes_read < 0) {
-							printf("Error receiving from client %d\n", fd_client);
-							close(fd_client);
-							FD_CLR(fd_client, &sock_set);
-						} else if (n_bytes_read == 0) {
-							printf("Client %d closed connection\n", fd_client);
-							close(fd_client);
-							FD_CLR(fd_client, &sock_set);
-						} else {
-							printf("Client %d wants file: %s\n", fd_client, server_buffer);
-							if (0 == wildcard_check(server_buffer)) {
-								printf("Forbidden character detected in file name\n");
-								continue;
-							}
-							fd_requested = open(server_buffer, O_RDONLY, 0600);
-
-							if (fd_requested < 0) {
-								memset(server_buffer, 0, sizeof(server_buffer));
-								strncpy(server_buffer, FILE_NOT_FOUND_MSG, strlen(FILE_NOT_FOUND_MSG));
-								n_bytes_sent = send(fd_client, server_buffer, strlen(FILE_NOT_FOUND_MSG), 0);
-								continue;
-							}
-
-							memset(server_buffer, 0, sizeof(server_buffer));
-							/* Read from requested file maximum BUFFER_SIZE bytes until the file ends */
-							n_bytes_read = read(fd_requested, &server_buffer, BUFFER_SIZE);
-							if (n_bytes_read < 0) {
-								printf("Error reading requested file\n");
-								memset(server_buffer, 0, sizeof(server_buffer));
-								strncpy(server_buffer, FILE_NOT_FOUND_MSG, strlen(FILE_NOT_FOUND_MSG));
-								n_bytes_sent = send(fd_client, server_buffer, strlen(FILE_NOT_FOUND_MSG), 0);
-								continue;
-							}
-							while(n_bytes_read > 0) {
-								n_bytes_sent = send(fd_client, server_buffer, n_bytes_read, 0);
-								if (n_bytes_sent < 0) {
-									printf("Error sending file to client %d\n", fd_client);
-									continue;
-								}
-								if (n_bytes_sent < n_bytes_read) { /* Client buffer may be smaller */
-									while(n_bytes_sent != n_bytes_read) {
-										n_bytes_sent += send(fd_client, server_buffer + n_bytes_sent, n_bytes_read - n_bytes_sent, 0);
-									}
-								}
-								memset(server_buffer, 0, sizeof(server_buffer));
-								n_bytes_read = read(fd_requested, &server_buffer, BUFFER_SIZE);
-							}
-						}
+						process_client(fd_client, &sock_set);
 					}
 				}
 				tmp_set = sock_set;
